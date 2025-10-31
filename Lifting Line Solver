@@ -1,1 +1,84 @@
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from scipy.interpolate import RegularGridInterpolator
 
+# === Function TOGGLE ===
+DEBUG = False
+Plot = True
+Print = False
+
+# Read JSON Values
+filename = "input.json"
+with open(filename, "r") as f:
+    data = json.load(f)
+
+AR = data["wing"]["planform"]["aspect_ratio"] # aspect ratio
+lamb = data["wing"]["planform"]["taper_ratio"] # taper ratio
+n = 1 + 2*data["wing"]["nodes_per_semispan"] #number of nodes
+cla = data["wing"]["airfoil_lift_slope"] #lift slope
+
+theta = np.linspace(0,np.pi,n)
+
+#define z in terms of theta
+z_b = -0.5 * np.cos(theta)
+#chord distribution 
+c_b = 2 * (1 - (1-lamb)*np.abs(np.cos(theta))) / AR/(1+lamb)
+print(c_b)
+
+# initialize C matrix
+C = np.zeros((n,n))
+
+def build_C(n, theta, cla, c_b):
+    for i in range(n):
+        for j in range(n):
+            n = j+1 # set start to 1
+            #adjust first line
+            if i==0: 
+                C[i, j] = n**2
+            #adjust last line  
+            elif i == n-1:
+                C[i, j]=((-1)**(n+1)) * (n**2)
+            else:
+                C[i, j] = (4/cla/c_b[i]+n/np.sin(theta[i])) * np.sin(n*theta[i])
+                
+    C_inv = np.linalg.inv(C)
+    return C_inv
+
+C_inv = build_C(n, theta, cla, c_b)
+
+an = np.matmul(C_inv, np.ones(n))
+
+#kappa values
+def calc_kd(n, an):
+    kd = 0
+    for i in range (1,n):
+        n = i+i
+        an_a1 = an[i]/an[0]
+        kd += n*an_a1**2
+    return kd
+
+kd = calc_kd(n, an)
+
+if isinstance(data["condition"]["alpha_root[deg]"], (int, float)):
+    alpha_r = np.radians(data["condition"]["alpha_root[deg]"])
+else:
+    alpha_r = 0 #add equation
+    
+A = an * alpha_r
+
+#lift calculation
+C_L = np.pi * AR * A[0]
+    
+"""
+Figures
+"""
+if Plot:
+    plt.figure()
+    plt.plot(z_b, c_b/4, ) #leading edge
+    plt.plot(z_b, c_b*-3) #trailing edge
+    for i in range(n):
+        plt.plot(z_b[i], z_b[i], [-3*c_b[i]/4], c_b[i]/4)
+    plt.show()
+    
