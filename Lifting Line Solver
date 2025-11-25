@@ -7,78 +7,335 @@ from scipy.interpolate import RegularGridInterpolator
 # === Function TOGGLE ===
 DEBUG = False
 Plot = True
-Print = False
+Print = True
 
 # Read JSON Values
 filename = "input.json"
 with open(filename, "r") as f:
     data = json.load(f)
 
-AR = data["wing"]["planform"]["aspect_ratio"] # aspect ratio
-lamb = data["wing"]["planform"]["taper_ratio"] # taper ratio
-n = 1 + 2*data["wing"]["nodes_per_semispan"] #number of nodes
-cla = data["wing"]["airfoil_lift_slope"] #lift slope
+# Wing planform parameters
+AR = data["wing"]["planform"]["aspect_ratio"]  # aspect ratio
+lamb = data["wing"]["planform"]["taper_ratio"]  # taper ratio
+n = 1 + 2 * data["wing"]["nodes_per_semispan"]  # number of nodes
+cla = data["wing"]["airfoil_lift_slope"]  # lift slope
 
-theta = np.linspace(0,np.pi,n)
+# Washout parameters
+wash_d = data["wing"]["washout"]["distribution"]  # washout distribution 
+wash_a = data["wing"]["washout"]["amount[deg]"]  # washout amount
+CL_d = data["wing"]["washout"]["CL_design"] if wash_a == "optimum" else None  # design lift coefficient
 
-#define z in terms of theta
-z_b = -0.5 * np.cos(theta)
-#chord distribution 
-c_b = 2 * (1 - (1-lamb)*np.abs(np.cos(theta))) / AR/(1+lamb)
-print(c_b)
+# Aileron parameters
+ail_begin_z = data["wing"]["aileron"]["begin[z/b]"]  # aileron begin in z
+ail_end_z = data["wing"]["aileron"]["end[z/b]"]  # aileron end in z
+ail_begin_cf = data["wing"]["aileron"]["begin[cf/c]"]  # aileron begin in cf
+ail_end_cf = data["wing"]["aileron"]["end[cf/c]"]  # aileron end in cf
+ail_hinge_eff = data["wing"]["aileron"]["hinge_efficiency"]  # aileron hinge efficiency
 
-# initialize C matrix
-C = np.zeros((n,n))
+# Condition parameters
+alpha_r_in = data["condition"]["alpha_root[deg]"]  # root alpha input
+CL_condition = data["condition"]["CL"]
+ail_def = data["condition"]["aileron_deflection[deg]"]  # aileron deflection
+pbar_in = data["condition"]["pbar"]  # pbar input
 
-def build_C(n, theta, cla, c_b):
+# View parameters
+view_planform = data["view"]["planform"]
+view_washout = data["view"]["washout_distribution"]
+view_aileron = data["view"]["aileron_distribution"]
+view_CL_hat = data["view"]["CL_hat_distributions"]
+view_CL_tilde = data["view"]["CL_tilde_distributions"]
+
+# Define theta and spanwise coordinates
+theta = np.linspace(0, np.pi, n)  # define z in terms of theta
+z_b = -0.5 * np.cos(theta)  # spanwise coordinate z/b
+
+# Chord distribution using the provided equation
+# c(θ)/b = 2/(R_A(1 + λ)) * [1 - (1 - λ)|cos(θ)|]
+c_b = (2 / (AR * (1 + lamb))) * (1 - (1 - lamb) * np.abs(np.cos(theta)))
+
+# Root chord for normalization
+c_root = c_b[n//2]  # chord at root (theta = pi/2, z = 0)
+
+if Print:
+    print("="*60)
+    print("WING GEOMETRY")
+    print("="*60)
+    print(f"Root chord (c_root/b): {c_root:.4f}")
+    print(f"Tip chord (c_tip/b): {c_b[0]:.4f}")
+    print(f"Taper ratio check (c_tip/c_root): {c_b[0]/c_root:.4f}")
+
+def calculate_washout_distribution(wash_d, theta, z_b, c_b, c_root):
+    """
+    Calculate washout distribution function based on the specified type.
+    This returns the normalized distribution (0 at root, varies to tips).
+    """
+    n = len(theta)
+    
+    if wash_d == "none":
+        # No washout
+        omega = np.zeros(n)
+        
+    elif wash_d == "linear":
+        # Linear washout: ω(θ) = |cos(θ)|
+        omega = np.abs(np.cos(theta))
+        
+    elif wash_d == "optimum":
+        # Optimum washout: ω_opt(θ) = 1 - sin(θ) / [c(θ)/c_root]
+        # This minimizes induced drag for a given lift coefficient
+        omega = 1 - np.sin(theta) / (c_b / c_root)
+        
+    else:
+        raise ValueError(f"Unknown washout distribution type: {wash_d}")
+    
+    return omega
+
+def calculate_optimum_washout_amount(CL_d, AR, lamb, cla, n):
+    """
+    Calculate the optimum washout amount Ω_opt for minimum induced drag
+    at a specified design lift coefficient using Eq. (6.32).
+    """
+    # For optimum washout, we need to solve for the washout amount that
+    # produces an elliptic lift distribution at the design CL
+    
+    # First, get the chord distribution
+    theta_temp = np.linspace(0, np.pi, n)
+    c_b_temp = (2 / (AR * (1 + lamb))) * (1 - (1 - lamb) * np.abs(np.cos(theta_temp)))
+    c_root_temp = c_b_temp[n//2]
+    
+    # Get optimum washout distribution
+    omega_opt = 1 - np.sin(theta_temp) / (c_b_temp / c_root_temp)
+    
+    # For elliptic loading: CL = cla * alpha_eff * (local chord factor)
+    # The optimum washout creates constant circulation, which for elliptic loading means:
+    # Ω_opt ≈ CL_d * k, where k depends on geometry
+    
+    # Simplified formula (Eq. 6.32 approximation):
+    # Ω_opt = CL_d / (cla/AR + π)
+    # More accurate: account for taper
+    
+    k_factor = AR / (cla + np.pi * AR)  # washout effectiveness factor
+    Omega_opt = CL_d / k_factor
+    
+    return Omega_opt
+
+# Calculate washout distribution function
+omega = calculate_washout_distribution(wash_d, theta, z_b, c_b, c_root)
+
+# Determine washout amount Ω (twist at tip relative to root)
+if isinstance(wash_a, (int, float)):
+    # Direct specification of washout amount in degrees
+    Omega = np.radians(wash_a)
+    washout_type = "specified"
+    if Print:
+        print(f"\n{'='*60}")
+        print("WASHOUT CONFIGURATION")
+        print("="*60)
+        print(f"Distribution type: {wash_d}")
+        print(f"Washout amount: {wash_a}° (user specified)")
+        
+elif wash_a == "optimum":
+    # Calculate optimum washout amount for the design CL
+    if CL_d is not None:
+        Omega = calculate_optimum_washout_amount(CL_d, AR, lamb, cla, n)
+        washout_type = "optimum"
+        if Print:
+            print(f"\n{'='*60}")
+            print("WASHOUT CONFIGURATION")
+            print("="*60)
+            print(f"Distribution type: {wash_d}")
+            print(f"Design CL: {CL_d}")
+            print(f"Optimum washout amount: {np.degrees(Omega):.4f}° (calculated)")
+    else:
+        Omega = 0
+        washout_type = "none"
+        print("Warning: CL_d required for optimum washout amount, using Ω = 0")
+else:
+    Omega = 0
+    washout_type = "none"
+
+# Apply washout: geometric twist distribution
+# epsilon(theta) = -Ω * omega(theta)
+# Negative because washout reduces angle of attack toward tips
+epsilon = -Omega * omega
+
+if Print:
+    print(f"Omega at tip: {np.degrees(Omega):.4f}°")
+    print(f"Omega distribution: min={np.degrees(epsilon.min()):.4f}°, max={np.degrees(epsilon.max()):.4f}°")
+
+def build_C_with_washout(n, theta, cla, c_b):
+    """
+    Build the influence coefficient matrix C and return its inverse.
+    """
+    C = np.zeros((n, n))
+    
     for i in range(n):
         for j in range(n):
-            n = j+1 # set start to 1
-            #adjust first line
-            if i==0: 
-                C[i, j] = n**2
-            #adjust last line  
-            elif i == n-1:
-                C[i, j]=((-1)**(n+1)) * (n**2)
+            m = j + 1  # harmonic number (set start to 1)
+            # adjust first line (symmetry condition at root)
+            if i == 0:
+                C[i, j] = m**2
+            # adjust last line (Kutta condition at tip)
+            elif i == n - 1:
+                C[i, j] = ((-1)**(m + 1)) * (m**2)
+            # interior collocation points
             else:
-                C[i, j] = (4/cla/c_b[i]+n/np.sin(theta[i])) * np.sin(n*theta[i])
-                
+                C[i, j] = (4 / (cla * c_b[i]) + m / np.sin(theta[i])) * np.sin(m * theta[i])
+    
     C_inv = np.linalg.inv(C)
     return C_inv
 
-C_inv = build_C(n, theta, cla, c_b)
+# Build influence matrix
+C_inv = build_C_with_washout(n, theta, cla, c_b)
 
-an = np.matmul(C_inv, np.ones(n))
+# Handle alpha_root - check if it's a number or "CL"
+if isinstance(alpha_r_in, (int, float)):
+    alpha_r = np.radians(alpha_r_in)
+    alpha_type = "specified"
+elif alpha_r_in == "CL":
+    alpha_type = "from_CL"
+    # Will be calculated after solving for Fourier coefficients
+    alpha_r = np.radians(5.0)  # Initial guess
+else:
+    alpha_r = 0
+    alpha_type = "default"
 
-#kappa values
+# Right-hand side: effective angle of attack at each collocation point
+# RHS = alpha_root + epsilon(theta) for interior points
+rhs = np.ones(n)
+for i in range(1, n-1):
+    rhs[i] = 1 + epsilon[i] / alpha_r if alpha_r != 0 else 1
+
+# Solve for Fourier coefficients
+an = np.matmul(C_inv, rhs)
+
+# If alpha specified by CL, solve for alpha_root
+if alpha_type == "from_CL":
+    # CL = pi * AR * a1 * alpha_r
+    # Solve iteratively
+    for iteration in range(10):  # Simple iteration
+        an = np.matmul(C_inv, rhs)
+        alpha_r_new = CL_condition / (np.pi * AR * an[0])
+        
+        # Update RHS with new alpha_r
+        for i in range(1, n-1):
+            rhs[i] = 1 + epsilon[i] / alpha_r_new
+        
+        if abs(alpha_r_new - alpha_r) < 1e-6:
+            break
+        alpha_r = alpha_r_new
+    
+    an = np.matmul(C_inv, rhs)
+
+A = an * alpha_r  # Fourier coefficients for lift distribution
+C_L = np.pi * AR * A[0]  # Total lift coefficient
+
 def calc_kd(n, an):
+    """
+    Calculate the induced drag factor.
+    """
     kd = 0
-    for i in range (1,n):
-        n = i+i
-        an_a1 = an[i]/an[0]
-        kd += n*an_a1**2
+    for i in range(1, n):
+        m = i + 1  # harmonic number
+        an_a1 = an[i] / an[0]
+        kd += m * an_a1**2
     return kd
 
 kd = calc_kd(n, an)
 
-if isinstance(data["condition"]["alpha_root[deg]"], (int, float)):
-    alpha_r = np.radians(data["condition"]["alpha_root[deg]"])
-else:
-    alpha_r = 0 #add equation
-    
-A = an * alpha_r
+# Calculate Oswald efficiency factor
+e = 1 / (1 + kd)
 
-#lift calculation
-C_L = np.pi * AR * A[0]
+# Calculate induced drag coefficient
+C_Di = C_L**2 / (np.pi * AR * e)
+
+# Calculate effective angle of attack distribution (including washout)
+alpha_eff = alpha_r + epsilon
+
+# Calculate local lift coefficient distribution
+C_l = cla * alpha_eff
+
+if Print:
+    print(f"\n{'='*60}")
+    print("AERODYNAMIC RESULTS")
+    print("="*60)
+    print(f"Root angle of attack: {np.degrees(alpha_r):.4f}°")
+    print(f"Lift coefficient CL: {C_L:.4f}")
+    print(f"Induced drag factor kd: {kd:.6f}")
+    print(f"Oswald efficiency e: {e:.4f}")
+    print(f"Induced drag coefficient CDi: {C_Di:.6f}")
+    if washout_type == "optimum":
+        print(f"\nNote: Optimum washout minimizes induced drag at CL = {CL_d}")
+
+""" Figures """
+if Plot and view_planform:
+    plt.figure(figsize=(12, 6))
     
-"""
-Figures
-"""
-if Plot:
-    plt.figure()
-    plt.plot(z_b, c_b/4, ) #leading edge
-    plt.plot(z_b, c_b*-3) #trailing edge
+    # Plot wing planform
+    plt.plot(z_b, c_b / 4, 'b-', linewidth=2, label='Leading edge')
+    plt.plot(z_b, -3 * c_b / 4, 'b-', linewidth=2, label='Trailing edge')
+    
+    # Plot ribs/nodes
     for i in range(n):
-        plt.plot(z_b[i], z_b[i], [-3*c_b[i]/4], c_b[i]/4)
-    plt.show()
+        plt.plot([z_b[i], z_b[i]], [-3 * c_b[i] / 4, c_b[i] / 4], 'k-', linewidth=0.5, alpha=0.5)
     
+    # Add quarter-chord line
+    plt.plot(z_b, np.zeros_like(z_b), 'r--', linewidth=1, alpha=0.7, label='Quarter-chord line')
+    
+    plt.xlabel('Spanwise position (z/b)', fontsize=12)
+    plt.ylabel('Chordwise position (x/c relative to c/4)', fontsize=12)
+    plt.title(f'Wing Planform (AR={AR}, λ={lamb})', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+if Plot and view_washout:
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
+    
+    # Plot washout distribution function
+    ax1.plot(z_b, omega, 'b-', linewidth=2)
+    ax1.set_xlabel('Spanwise position (z/b)', fontsize=11)
+    ax1.set_ylabel('Washout distribution ω', fontsize=11)
+    ax1.set_title(f'Washout Distribution Function: {wash_d}', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim([-0.5, 0.5])
+    
+    # Plot geometric twist (washout angle)
+    ax2.plot(z_b, np.degrees(epsilon), 'r-', linewidth=2)
+    ax2.set_xlabel('Spanwise position (z/b)', fontsize=11)
+    ax2.set_ylabel('Geometric twist ε(θ) [deg]', fontsize=11)
+    ax2.set_title(f'Geometric Twist Distribution (Ω = {np.degrees(Omega):.2f}°)', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim([-0.5, 0.5])
+    ax2.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    
+    # Plot effective angle of attack
+    ax3.plot(z_b, np.degrees(alpha_eff), 'g-', linewidth=2, label='Effective α (with washout)')
+    ax3.axhline(y=np.degrees(alpha_r), color='b', linestyle='--', linewidth=1.5, label=f'Root α = {np.degrees(alpha_r):.2f}°')
+    ax3.set_xlabel('Spanwise position (z/b)', fontsize=11)
+    ax3.set_ylabel('Angle of attack [deg]', fontsize=11)
+    ax3.set_title('Effective Angle of Attack Distribution', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(fontsize=10)
+    ax3.set_xlim([-0.5, 0.5])
+    
+    plt.tight_layout()
+    plt.show()
+
+if Plot:
+    # Plot lift distribution
+    plt.figure(figsize=(10, 5))
+    
+    # Calculate local lift coefficient
+    plt.plot(z_b, C_l, 'b-', linewidth=2, label='Local Cl')
+    plt.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
+    
+    plt.xlabel('Spanwise position (z/b)', fontsize=12)
+    plt.ylabel('Local lift coefficient Cl', fontsize=12)
+    plt.title(f'Spanwise Lift Distribution (CL = {C_L:.4f})', fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=10)
+    plt.xlim([-0.5, 0.5])
+    plt.tight_layout()
+    plt.show()
